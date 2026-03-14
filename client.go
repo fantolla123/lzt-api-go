@@ -34,7 +34,7 @@ func WithProxy(proxyURL string) Option {
 	return func(c *Client) {
 		u, err := url.Parse(proxyURL)
 		if err != nil {
-			return
+			panic(fmt.Sprintf("lztapi: invalid proxy URL: %v", err))
 		}
 		transport := &http.Transport{Proxy: http.ProxyURL(u)}
 		c.httpClient.Transport = transport
@@ -59,28 +59,33 @@ func NewClient(token, baseURL string, opts ...Option) *Client {
 	return c
 }
 
-func (c *Client) DoRequest(method, path string, params url.Values, body any) (map[string]any, error) {
+func (c *Client) DoRequest(method, path string, params url.Values, body io.Reader) ([]byte, error) {
 	fullURL := c.baseURL + path
 	if params != nil && len(params) > 0 {
 		fullURL += "?" + params.Encode()
 	}
 
-	var bodyReader io.Reader
+	var bodyBytes []byte
 	if body != nil {
-		data, err := json.Marshal(body)
+		var err error
+		bodyBytes, err = io.ReadAll(body)
 		if err != nil {
 			return nil, err
 		}
-		bodyReader = bytes.NewReader(data)
 	}
 
 	for attempt := range maxRetries {
-		req, err := http.NewRequest(method, fullURL, bodyReader)
+		var reqBody io.Reader
+		if bodyBytes != nil {
+			reqBody = bytes.NewReader(bodyBytes)
+		}
+
+		req, err := http.NewRequest(method, fullURL, reqBody)
 		if err != nil {
 			return nil, err
 		}
 		req.Header.Set("Authorization", "Bearer "+c.token)
-		if body != nil {
+		if bodyBytes != nil {
 			req.Header.Set("Content-Type", "application/json")
 		}
 
@@ -88,39 +93,35 @@ func (c *Client) DoRequest(method, path string, params url.Values, body any) (ma
 		if err != nil {
 			return nil, err
 		}
-		defer resp.Body.Close()
+
+		respBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
 
 		if retryStatuses[resp.StatusCode] {
 			if attempt == maxRetries-1 {
 				if resp.StatusCode == 429 {
-					return nil, &RateLimitError{}
+					return nil, &RateLimitError{RetryAfter: getRetryDelay(resp, attempt)}
 				}
-				return nil, handleError(resp)
+				return nil, handleErrorBytes(resp.StatusCode, respBody)
 			}
 			delay := getRetryDelay(resp, attempt)
 			time.Sleep(time.Duration(delay * float64(time.Second)))
-			if bodyReader != nil {
-				if seeker, ok := bodyReader.(io.Seeker); ok {
-					seeker.Seek(0, io.SeekStart)
-				}
-			}
 			continue
 		}
 
-		if err := handleError(resp); err != nil {
+		if err := handleErrorBytes(resp.StatusCode, respBody); err != nil {
 			return nil, err
 		}
 
-		var result map[string]any
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			return nil, err
-		}
-		return result, nil
+		return respBody, nil
 	}
 	return nil, fmt.Errorf("lztapi: max retries exceeded")
 }
 
-func (c *Client) DoMultipart(method, path string, params url.Values, fields map[string]string, files map[string]io.Reader) (map[string]any, error) {
+func (c *Client) DoMultipart(method, path string, params url.Values, fields map[string]string, files map[string]io.Reader) ([]byte, error) {
 	fullURL := c.baseURL + path
 	if params != nil && len(params) > 0 {
 		fullURL += "?" + params.Encode()
@@ -143,67 +144,70 @@ func (c *Client) DoMultipart(method, path string, params url.Values, fields map[
 	}
 	writer.Close()
 
+	bodyBytes := buf.Bytes()
+	contentType := writer.FormDataContentType()
+
 	for attempt := range maxRetries {
-		req, err := http.NewRequest(method, fullURL, bytes.NewReader(buf.Bytes()))
+		req, err := http.NewRequest(method, fullURL, bytes.NewReader(bodyBytes))
 		if err != nil {
 			return nil, err
 		}
 		req.Header.Set("Authorization", "Bearer "+c.token)
-		req.Header.Set("Content-Type", writer.FormDataContentType())
+		req.Header.Set("Content-Type", contentType)
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			return nil, err
 		}
-		defer resp.Body.Close()
+
+		respBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
 
 		if retryStatuses[resp.StatusCode] {
 			if attempt == maxRetries-1 {
 				if resp.StatusCode == 429 {
-					return nil, &RateLimitError{}
+					return nil, &RateLimitError{RetryAfter: getRetryDelay(resp, attempt)}
 				}
-				return nil, handleError(resp)
+				return nil, handleErrorBytes(resp.StatusCode, respBody)
 			}
 			delay := getRetryDelay(resp, attempt)
 			time.Sleep(time.Duration(delay * float64(time.Second)))
 			continue
 		}
 
-		if err := handleError(resp); err != nil {
+		if err := handleErrorBytes(resp.StatusCode, respBody); err != nil {
 			return nil, err
 		}
 
-		var result map[string]any
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			return nil, err
-		}
-		return result, nil
+		return respBody, nil
 	}
 	return nil, fmt.Errorf("lztapi: max retries exceeded")
 }
 
-func handleError(resp *http.Response) error {
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+func handleErrorBytes(statusCode int, body []byte) error {
+	if statusCode >= 200 && statusCode < 300 {
 		return nil
 	}
-	if resp.StatusCode == 401 {
+	if statusCode == 401 {
 		return &AuthError{}
 	}
-	if resp.StatusCode == 404 {
+	if statusCode == 404 {
 		return &NotFoundError{}
 	}
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
+	if statusCode >= 400 {
+		msg := string(body)
 		var errResp struct {
 			Error struct {
 				Message string `json:"message"`
 			} `json:"error"`
 		}
-		msg := string(body)
-		if json.Unmarshal(body, &errResp) == nil && errResp.Error.Message != "" {
+		if err := json.Unmarshal(body, &errResp); err == nil && errResp.Error.Message != "" {
 			msg = errResp.Error.Message
 		}
-		return &APIError{StatusCode: resp.StatusCode, Message: msg}
+		return &APIError{StatusCode: statusCode, Message: msg}
 	}
 	return nil
 }

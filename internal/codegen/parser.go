@@ -2,6 +2,7 @@ package codegen
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
@@ -9,25 +10,25 @@ import (
 )
 
 type Parameter struct {
-	Name       string
-	GoName     string
-	ParamName  string
-	Location   string
-	Required   bool
-	TypeHint   string
-	Default    any
-	JSONName   string
+	Name      string
+	GoName    string
+	ParamName string
+	Location  string
+	Required  bool
+	TypeHint  string
+	Default   any
+	JSONName  string
 }
 
 type Endpoint struct {
-	Path            string
-	Method          string
-	OperationID     string
-	MethodName      string
-	Parameters      []Parameter
-	RequestBody     []Parameter
-	ResponseModel   string
-	IsMultipart     bool
+	Path          string
+	Method        string
+	OperationID   string
+	MethodName    string
+	Parameters    []Parameter
+	RequestBody   []Parameter
+	ResponseModel string
+	IsMultipart   bool
 }
 
 type Field struct {
@@ -39,9 +40,9 @@ type Field struct {
 }
 
 type Model struct {
-	Name      string
-	GoName    string
-	Fields    []Field
+	Name   string
+	GoName string
+	Fields []Field
 }
 
 type OpenAPISpec struct {
@@ -85,19 +86,29 @@ func ParseSchema(path string) (*ParseResult, error) {
 		}
 	}
 
-	result.Models = parseSchemas(spec)
-	endpoints, inlineModels := parsePaths(spec)
+	models, err := parseSchemas(spec)
+	if err != nil {
+		return nil, err
+	}
+	result.Models = models
+
+	endpoints, inlineModels, err := parsePaths(spec)
+	if err != nil {
+		return nil, err
+	}
 	result.Endpoints = endpoints
 	result.Models = append(result.Models, inlineModels...)
 
 	return result, nil
 }
 
-func parseSchemas(spec OpenAPISpec) []Model {
+func parseSchemas(spec OpenAPISpec) ([]Model, error) {
 	var models []Model
 	for name, raw := range spec.Components.Schemas {
 		var schema map[string]any
-		json.Unmarshal(raw, &schema)
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			return nil, fmt.Errorf("unmarshal schema %s: %w", name, err)
+		}
 
 		schemaType, _ := schema["type"].(string)
 		_, hasProps := schema["properties"]
@@ -131,10 +142,10 @@ func parseSchemas(spec OpenAPISpec) []Model {
 		}
 		models = append(models, model)
 	}
-	return models
+	return models, nil
 }
 
-func parsePaths(spec OpenAPISpec) ([]Endpoint, []Model) {
+func parsePaths(spec OpenAPISpec) ([]Endpoint, []Model, error) {
 	var endpoints []Endpoint
 	var inlineModels []Model
 	httpMethods := map[string]bool{"get": true, "post": true, "put": true, "delete": true, "patch": true}
@@ -146,7 +157,9 @@ func parsePaths(spec OpenAPISpec) ([]Endpoint, []Model) {
 			}
 
 			var opSpec map[string]any
-			json.Unmarshal(raw, &opSpec)
+			if err := json.Unmarshal(raw, &opSpec); err != nil {
+				return nil, nil, fmt.Errorf("unmarshal operation %s %s: %w", method, path, err)
+			}
 
 			operationID, _ := opSpec["operationId"].(string)
 			if operationID == "" {
@@ -162,7 +175,10 @@ func parsePaths(spec OpenAPISpec) ([]Endpoint, []Model) {
 
 			if params, ok := opSpec["parameters"].([]any); ok {
 				for _, p := range params {
-					param := resolveParameter(spec, p)
+					param, err := resolveParameter(spec, p)
+					if err != nil {
+						return nil, nil, err
+					}
 					if param == nil {
 						continue
 					}
@@ -179,7 +195,7 @@ func parsePaths(spec OpenAPISpec) ([]Endpoint, []Model) {
 						Location:  location,
 						Required:  required,
 						TypeHint:  typeHint,
-						JSONName: paramName,
+						JSONName:  paramName,
 					})
 				}
 			}
@@ -215,7 +231,7 @@ func parsePaths(spec OpenAPISpec) ([]Endpoint, []Model) {
 							Location:  location,
 							Required:  requiredSet[propName],
 							TypeHint:  typeHint,
-							JSONName: propName,
+							JSONName:  propName,
 						})
 					}
 					break
@@ -278,7 +294,7 @@ func parsePaths(spec OpenAPISpec) ([]Endpoint, []Model) {
 		if nameCounts[endpoints[i].MethodName] > 1 {
 			idx := nameIdx[endpoints[i].MethodName]
 			nameIdx[endpoints[i].MethodName]++
-			suffix := strings.Title(strings.ToLower(endpoints[i].Method))
+			suffix := strings.ToUpper(endpoints[i].Method[:1]) + strings.ToLower(endpoints[i].Method[1:])
 			if idx > 0 {
 				endpoints[i].MethodName = endpoints[i].MethodName + suffix + string(rune('0'+idx))
 			} else {
@@ -287,25 +303,27 @@ func parsePaths(spec OpenAPISpec) ([]Endpoint, []Model) {
 		}
 	}
 
-	return endpoints, inlineModels
+	return endpoints, inlineModels, nil
 }
 
-func resolveParameter(spec OpenAPISpec, raw any) *map[string]any {
+func resolveParameter(spec OpenAPISpec, raw any) (*map[string]any, error) {
 	m, ok := raw.(map[string]any)
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	if ref, ok := m["$ref"].(string); ok {
 		parts := strings.Split(ref, "/")
 		name := parts[len(parts)-1]
 		if paramRaw, ok := spec.Components.Parameters[name]; ok {
 			var resolved map[string]any
-			json.Unmarshal(paramRaw, &resolved)
-			return &resolved
+			if err := json.Unmarshal(paramRaw, &resolved); err != nil {
+				return nil, fmt.Errorf("unmarshal parameter %s: %w", name, err)
+			}
+			return &resolved, nil
 		}
-		return nil
+		return nil, nil
 	}
-	return &m
+	return &m, nil
 }
 
 func resolveSchema(spec OpenAPISpec, schema map[string]any) map[string]any {
@@ -314,7 +332,9 @@ func resolveSchema(spec OpenAPISpec, schema map[string]any) map[string]any {
 		name := parts[len(parts)-1]
 		if raw, ok := spec.Components.Schemas[name]; ok {
 			var resolved map[string]any
-			json.Unmarshal(raw, &resolved)
+			if err := json.Unmarshal(raw, &resolved); err != nil {
+				return schema
+			}
 			return resolved
 		}
 	}
@@ -343,7 +363,9 @@ func openAPITypeToGo(schema map[string]any) string {
 		if globalSpec != nil {
 			if raw, ok := globalSpec.Components.Schemas[refName]; ok {
 				var resolved map[string]any
-				json.Unmarshal(raw, &resolved)
+				if err := json.Unmarshal(raw, &resolved); err != nil {
+					return "any"
+				}
 				schemaType, _ := resolved["type"].(string)
 				_, hasProps := resolved["properties"]
 				if schemaType != "object" && !hasProps {

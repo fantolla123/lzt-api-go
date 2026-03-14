@@ -158,6 +158,7 @@ func prepareEndpoints(endpoints []Endpoint) []TemplateEndpoint {
 var clientTemplate = `package {{.Package}}
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"{{if .HasFileParams}}
 	"io"{{end}}
@@ -223,36 +224,40 @@ func (c *Client) {{.MethodName}}({{range .PathParams}}{{.ParamName}} {{.TypeHint
 
 	raw, err := c.DoMultipart("{{.Method}}", path, {{if .QueryParams}}params{{else}}nil{{end}}, fields, files)
 {{- else if .BodyParams}}
-	body := map[string]any{}
+	bodyMap := map[string]any{}
 {{- range .BodyParams}}
 {{- if .Required}}
-	body["{{.Name}}"] = {{.ParamName}}
+	bodyMap["{{.Name}}"] = {{.ParamName}}
 {{- else}}
 	if p.{{.GoName}} != nil {
-		body["{{.Name}}"] = *p.{{.GoName}}
+		bodyMap["{{.Name}}"] = *p.{{.GoName}}
 	}
 {{- end}}
 {{- end}}
+	bodyJSON, err := json.Marshal(bodyMap)
+	if err != nil {
+		return nil, err
+	}
 
-	raw, err := c.DoRequest("{{.Method}}", path, {{if .QueryParams}}params{{else}}nil{{end}}, body)
+	raw, err := c.DoRequest("{{.Method}}", path, {{if .QueryParams}}params{{else}}nil{{end}}, bytes.NewReader(bodyJSON))
 {{- else}}
 	raw, err := c.DoRequest("{{.Method}}", path, {{if .QueryParams}}params{{else}}nil{{end}}, nil)
 {{- end}}
 	if err != nil {
-		return {{if .ResponseModel}}nil{{else}}nil{{end}}, err
-	}
-{{if .ResponseModel}}
-	data, err := json.Marshal(raw)
-	if err != nil {
 		return nil, err
 	}
+{{if .ResponseModel}}
 	var result {{.ResponseModel}}
-	if err := json.Unmarshal(data, &result); err != nil {
+	if err := json.Unmarshal(raw, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
 {{- else}}
-	return raw, nil
+	var result map[string]any
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
 {{- end}}
 }
 
